@@ -14,8 +14,9 @@ import shutil
 import time
 import zlib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from . import config, db
 
@@ -191,20 +192,39 @@ def _lock_path(job_id: str) -> Path:
 
 
 def acquire_job_lock(job_id: str):
-    """Exclusive flock held for the whole processing/publish cycle."""
-    wd = _work_dir(job_id)
-    wd.mkdir(parents=True, exist_ok=True)
-    fh = open(_lock_path(job_id), "w")
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        fh.close()
-        if exc.errno in (errno.EACCES, errno.EAGAIN):
-            raise RuntimeError(f"job {job_id} is locked by another instance") from exc
-        raise
-    fh.write(f"{os.getpid()}\n")
-    fh.flush()
-    return fh
+    """Exclusive flock held for the whole processing/publish cycle.
+
+    Retries for a bounded time: startup recovery may briefly hold the lock
+    of a dead job while it checks/deletes debris, and a requeued job can be
+    claimed in that window. The work directory (or lock file) may also have
+    just been removed by recovery, so both are recreated as needed.
+    """
+    deadline = time.monotonic() + config.LOCK_ACQUIRE_SECONDS
+    while True:
+        wd = _work_dir(job_id)
+        try:
+            wd.mkdir(parents=True, exist_ok=True)
+            fh = open(_lock_path(job_id), "w")
+        except OSError:
+            # Directory vanished under us (recovery cleanup); recreate.
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+            continue
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            fh.close()
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"job {job_id} is locked by another instance") from exc
+                time.sleep(0.1)
+                continue
+            raise
+        fh.write(f"{os.getpid()}\n")
+        fh.flush()
+        return fh
 
 
 def process_job(job_row, instance_id: str) -> None:
@@ -229,6 +249,9 @@ def process_job(job_row, instance_id: str) -> None:
     tmp_publish = config.PUBLISHED_DIR / "lanes" / f".tmp.{job_id}"
     final_publish = config.PUBLISHED_DIR / "lanes" / lane
     try:
+        # Prove liveness right after the claim -> lock handoff so startup
+        # recovery on a sibling instance never mistakes us for a dead owner.
+        db.heartbeat(job_id, instance_id)
         # Remove leftovers from a previous crashed attempt of this same job.
         if staged.exists():
             shutil.rmtree(staged)
@@ -259,6 +282,7 @@ def process_job(job_row, instance_id: str) -> None:
                     db.heartbeat(job_id, instance_id)
         finally:
             writers.close()
+        db.heartbeat(job_id, instance_id)
 
         # Every bucket (samples + quarantine), both mates, must exist and be
         # a readable gzip file, even when the bucket received no reads.
@@ -274,6 +298,7 @@ def process_job(job_row, instance_id: str) -> None:
                 except (OSError, EOFError, zlib.error) as exc:
                     raise FastqFormatError(
                         f"output {p.name} is not a valid gzip: {exc}") from exc
+        db.heartbeat(job_id, instance_id)
 
         # Atomic same-filesystem move into the published tree.
         tmp_publish.parent.mkdir(parents=True, exist_ok=True)
@@ -311,12 +336,37 @@ def process_job(job_row, instance_id: str) -> None:
 
 
 # ---------------- startup recovery ----------------
+#
+# Recovery runs on every instance start, possibly while sibling instances are
+# actively claiming, processing and publishing lanes on the same volume. It
+# must therefore obey three invariants, all enforced on *freshly re-read*
+# state rather than cached snapshots:
+#
+#   1. A 'processing' job whose flock is held OR whose heartbeat is fresh is
+#      live: it is never marked failed and its files are never touched. The
+#      fresh-heartbeat rule covers the claim -> lock handoff, where the job
+#      is already 'processing' but has not created its lock file yet.
+#   2. A lane with a lane_publishes row is a published product: its directory
+#      is never deleted, even if the job row or lock looks odd.
+#   3. Every delete of a job-associated path is serialized against the job
+#      flock: recovery holds the lock across the final state re-check and the
+#      delete. A worker holds that lock for its whole process/publish cycle,
+#      so a publish can neither be mid-flight nor start while recovery holds
+#      it — the check and the delete are atomic with respect to publishing.
+#
+# Everything uses LOCK_NB (recovery never waits on a live lane) and every
+# step is idempotent, so a recovery run that is itself interrupted simply
+# resumes on the next start.
+
+RecoveryHook = Callable[[str, str], None]
+
 
 def _lock_is_free(path: Path) -> bool:
     """True iff nobody currently holds flock on path."""
-    if not path.exists():
-        return True
-    fh = open(path, "r")
+    try:
+        fh = open(path, "r")
+    except OSError:
+        return True  # missing (or just unlinked) lock file: nothing held
     try:
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -330,74 +380,231 @@ def _lock_is_free(path: Path) -> bool:
         fh.close()
 
 
-def recover_on_startup() -> list[str]:
-    """Clean debris from truly interrupted runs. Never touches live or
-    published data: flock ownership protects live instances, DB rows protect
-    published lanes."""
-    notes: list[str] = []
-    conn = db.get_conn()
+def _hold_job_lock(job_id: str):
+    """Hold the job's existing flock for a delete decision.
 
-    # 1. Jobs stuck in 'processing' whose owner lock is free (process dead).
-    #    The flock is the authority: a live instance always holds it, so a
-    #    free lock means the owner truly disappeared even if the heartbeat
-    #    timestamp happens to look fresh.
+    Returns False when a live owner holds the lock, None when no lock file
+    exists (then nobody can be inside the locked process/publish section —
+    a not-yet-locked fresh claim is caught by the heartbeat re-check), else
+    an open handle the caller must release. Never creates files: recovery
+    must not leave debris of its own.
+    """
+    path = _lock_path(job_id)
+    try:
+        fh = open(path, "r")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        fh.close()
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            return False
+        raise
+    return fh
+
+
+def _release(fh) -> None:
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
+def _heartbeat_fresh(job_row, now: float) -> bool:
+    """True when the job's last heartbeat is inside the recovery grace."""
+    hb = job_row["heartbeat_at"]
+    if not hb:
+        return False
+    try:
+        ts = datetime.fromisoformat(hb).timestamp()
+    except (TypeError, ValueError):
+        return False
+    return (now - ts) < config.RECOVERY_GRACE_SECONDS
+
+
+def _job_is_live(job_row, now: float) -> bool:
+    """A 'processing' job is live when its flock is held or its heartbeat is
+    fresh (the claim -> lock window carries the fresh claim heartbeat)."""
+    if not _lock_is_free(_lock_path(job_row["job_id"])):
+        return True
+    return _heartbeat_fresh(job_row, now)
+
+
+def _delete_with_job_lock(path: Path, job_id: str, still_safe,
+                          notes: list[str], hook: RecoveryHook,
+                          note: str) -> None:
+    """Delete `path` after a fresh re-check, serialized on the job lock.
+
+    When the job's lock file exists we hold it across the `still_safe()`
+    re-check and the delete; because a worker holds that same lock for its
+    entire process/publish cycle, the re-check and the delete cannot
+    straddle a concurrent publish of this job. When no lock file exists the
+    fresh heartbeat/status re-check alone is authoritative (a live owner
+    always has either the lock or a fresh claim heartbeat).
+    """
+    held = _hold_job_lock(job_id)
+    if held is False:
+        return  # live owner: leave everything alone
+    try:
+        if not still_safe():
+            return
+        hook("delete:before", str(path))
+        shutil.rmtree(path, ignore_errors=True)
+        notes.append(note)
+    finally:
+        if held is not None:
+            _release(held)
+
+
+def _reap_work_dir(wd: Path, now: float, notes: list[str],
+                   hook: RecoveryHook) -> None:
+    """Remove a work directory unless a live job owns it right now."""
+    hook("work_dir:check", wd.name)
+    job = db.get_job(wd.name)
+    if job is None:
+        # No job row at all: pure orphan. Respect a held lock and give a
+        # just-created directory a short grace before reclaiming it.
+        if not _lock_is_free(wd / "lock"):
+            return
+        try:
+            age = time.time() - wd.stat().st_mtime
+        except OSError:
+            return  # vanished (or unstatable) mid-scan: leave it alone
+        if age < 5:
+            return
+        hook("delete:before", str(wd))
+        shutil.rmtree(wd, ignore_errors=True)
+        notes.append(f"removing orphan work directory {wd.name}")
+        return
+    if job["status"] == "processing" and _job_is_live(job, now):
+        return  # actively processed by a sibling instance
+
+    def still_safe() -> bool:
+        fresh = db.get_job(wd.name)
+        if fresh is None:
+            return True
+        # A (re-)claim landing while we decided must stop the delete.
+        return not (fresh["status"] == "processing"
+                    and _job_is_live(fresh, now))
+
+    _delete_with_job_lock(wd, wd.name, still_safe, notes, hook,
+                          f"removing work directory {wd.name}")
+
+
+def _reap_tmp_staging(child: Path, now: float, notes: list[str],
+                      hook: RecoveryHook) -> None:
+    """Remove a `.tmp.<job>` publish-staging dir with no live publisher."""
+    job_id = child.name[len(".tmp."):]
+    hook("tmp_dir:check", job_id)
+    job = db.get_job(job_id)
+    if job is not None and job["status"] == "processing" \
+            and _job_is_live(job, now):
+        return  # sibling instance is mid-publish for this job
+
+    def still_safe() -> bool:
+        fresh = db.get_job(job_id)
+        if fresh is not None and fresh["status"] == "processing" \
+                and _job_is_live(fresh, now):
+            return False
+        return True
+
+    _delete_with_job_lock(child, job_id, still_safe, notes, hook,
+                          f"removing unfinished publish staging {child.name}")
+
+
+def _reap_lane_dir(child: Path, now: float, notes: list[str],
+                   hook: RecoveryHook) -> None:
+    """Remove a final lane dir only when it is not, and is not becoming,
+    a published product."""
+    lane = child.name
+    hook("lane_dir:check", lane)
+    if db.lane_is_published(lane):
+        return  # published product: never touched
+    job = db.get_job_by_lane(lane)
+    if job is not None and job["status"] == "published":
+        return  # defensive: product of a published job
+    if job is not None and job["status"] == "processing" \
+            and _job_is_live(job, now):
+        return  # sibling instance is mid-publish for this lane
+    job_id = job["job_id"] if job is not None else None
+
+    def still_safe() -> bool:
+        # Re-read everything: a publish committing between our first look
+        # and the delete must stop it (this is the rolling-restart race).
+        if db.lane_is_published(lane):
+            return False
+        fresh = db.get_job_by_lane(lane)
+        if fresh is not None and fresh["status"] == "published":
+            return False
+        if fresh is not None and fresh["status"] == "processing" \
+                and _job_is_live(fresh, now):
+            return False
+        return True
+
+    if job_id is None:
+        if still_safe():
+            hook("delete:before", str(child))
+            shutil.rmtree(child, ignore_errors=True)
+            notes.append(f"removing unpublished lane directory {lane}")
+        return
+    _delete_with_job_lock(child, job_id, still_safe, notes, hook,
+                          f"removing unpublished lane directory {lane}")
+
+
+def recover_on_startup(event_hook: RecoveryHook | None = None) -> list[str]:
+    """Reclaim debris from truly interrupted runs; see invariants above.
+
+    `event_hook(phase, subject)` — when given — is invoked at defined
+    handoff points so tests can inject controlled interleavings (e.g. a
+    publish committing while recovery is mid-scan).
+    """
+    notes: list[str] = []
+
+    def hook(phase: str, subject: str = "") -> None:
+        if event_hook is not None:
+            event_hook(phase, subject)
+
+    conn = db.get_conn()
+    now = time.time()
+    # Same UTC ISO format as db.utcnow(), so lexicographic comparison in the
+    # SQL predicate matches chronological order.
+    stale_before = datetime.fromtimestamp(
+        now - config.RECOVERY_GRACE_SECONDS, timezone.utc).isoformat()
+
+    hook("start")
+
+    # 1. Jobs stuck in 'processing' whose owner is truly gone. The flock
+    #    pre-check is the first authority (a live processor always holds
+    #    it); the atomic stale-heartbeat predicate is the second — a fresh
+    #    claim heartbeat makes the UPDATE a no-op, so the claim -> lock
+    #    handoff window can never be misjudged as a crash. Scratch removal
+    #    is left to steps 2/3 so an interrupted recovery simply resumes.
     for job in conn.execute(
             "SELECT * FROM jobs WHERE status='processing'").fetchall():
-        lock = _lock_path(job["job_id"])
-        if not _lock_is_free(lock):
+        if not _lock_is_free(_lock_path(job["job_id"])):
             continue  # another instance is actively working this job
-        notes.append(f"recovering interrupted job {job['job_id']}")
-        conn.execute(
-            "UPDATE jobs SET status='failed', instance_id=NULL,"
-            "error='interrupted (owner process disappeared)', updated_at=? "
-            "WHERE job_id=?", (db.utcnow(), job["job_id"]))
-        _remove_job_scratch(job, notes)
+        hook("mark_interrupted:before", job["job_id"])
+        if db.fail_interrupted_job(
+                job["job_id"], stale_before,
+                "interrupted (owner process disappeared)"):
+            notes.append(f"recovering interrupted job {job['job_id']}")
+    hook("mark_interrupted:after")
 
-    # 2. Orphan work directories with no processing job attached.
-    live_jobs = {
-        r["job_id"] for r in conn.execute(
-            "SELECT job_id FROM jobs WHERE status='processing'").fetchall()
-    }
-    for wd in config.WORK_DIR.iterdir():
-        if not wd.is_dir() or wd.name in live_jobs:
-            continue
-        lock = wd / "lock"
-        if lock.exists() and not _lock_is_free(lock):
-            continue  # owned by a live instance
-        if time.time() - wd.stat().st_mtime < 5:
-            continue  # just created, likely a racing sibling
-        notes.append(f"removing orphan work directory {wd.name}")
-        shutil.rmtree(wd, ignore_errors=True)
+    # 2. Work directories whose owning job is dead, finished or unknown.
+    if config.WORK_DIR.exists():
+        for wd in sorted(config.WORK_DIR.iterdir()):
+            if wd.is_dir():
+                _reap_work_dir(wd, now, notes, hook)
 
-    # 3. Unpublished staging directories left by a crashed publish.
+    # 3. Unpublished staging/final directories in the published tree.
     lanes_root = config.PUBLISHED_DIR / "lanes"
     if lanes_root.exists():
-        published = {r["lane"] for r in conn.execute(
-            "SELECT lane FROM lane_publishes").fetchall()}
-        jobs_by_id = {r["job_id"]: r for r in conn.execute(
-            "SELECT * FROM jobs").fetchall()}
-        for child in lanes_root.iterdir():
+        for child in sorted(lanes_root.iterdir()):
             if child.name.startswith(".tmp."):
-                job_id = child.name[len(".tmp."):]
-                job = jobs_by_id.get(job_id)
-                if job is not None and job["status"] == "processing" \
-                        and not _lock_is_free(_lock_path(job_id)):
-                    continue
-                notes.append(f"removing unfinished publish staging {child.name}")
-                shutil.rmtree(child, ignore_errors=True)
-            elif child.name not in published:
-                # Complete-looking lane dir without a DB publish row: never
-                # visible; safe to remove unless a live owner is publishing.
-                guarded = False
-                for job in jobs_by_id.values():
-                    if job["lane"] == child.name and job["status"] == "processing" \
-                            and not _lock_is_free(_lock_path(job["job_id"])):
-                        guarded = True
-                        break
-                if not guarded:
-                    notes.append(
-                        f"removing unpublished lane directory {child.name}")
-                    shutil.rmtree(child, ignore_errors=True)
+                _reap_tmp_staging(child, now, notes, hook)
+            elif child.is_dir():
+                _reap_lane_dir(child, now, notes, hook)
 
     # 4. Incoming debris of jobs that no longer need their uploads.
     #    A directory without a COMPLETE marker is an upload still streaming
@@ -411,32 +618,20 @@ def recover_on_startup() -> list[str]:
     }
     grace_seconds = 3600
     if config.INCOMING_DIR.exists():
-        now = time.time()
+        now_fs = time.time()
         for d in config.INCOMING_DIR.iterdir():
             if not d.is_dir() or d.name in keep_incoming:
                 continue
             if not (d / "COMPLETE").exists():
                 # Aborted mid-upload: only reclaim well after any plausible
                 # transfer could still be running.
-                if now - d.stat().st_mtime < grace_seconds:
+                try:
+                    age = now_fs - d.stat().st_mtime
+                except OSError:
+                    continue  # vanished mid-scan
+                if age < grace_seconds:
                     continue
             notes.append(f"removing stale incoming upload {d.name}")
             shutil.rmtree(d, ignore_errors=True)
+    hook("done")
     return notes
-
-
-def _remove_job_scratch(job_row, notes: list[str]) -> None:
-    job_id = job_row["job_id"]
-    lane = job_row["lane"]
-    wd = _work_dir(job_id)
-    if wd.exists():
-        shutil.rmtree(wd, ignore_errors=True)
-    tmp = config.PUBLISHED_DIR / "lanes" / f".tmp.{job_id}"
-    if tmp.exists():
-        shutil.rmtree(tmp, ignore_errors=True)
-    final = config.PUBLISHED_DIR / "lanes" / lane
-    if final.exists() and db.get_conn().execute(
-            "SELECT 1 FROM lane_publishes WHERE lane=?",
-            (lane,)).fetchone() is None:
-        shutil.rmtree(final, ignore_errors=True)
-    notes.append(f"cleared scratch for job {job_id}")

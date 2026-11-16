@@ -37,5 +37,15 @@ MAX_TOTAL_UNCOMPRESSED = 512 * 1024 * 1024  # 512 MiB across both mates
 HEARTBEAT_FLUSH_EVERY = 256  # records between heartbeat writes
 POLL_INTERVAL = float(os.environ.get("DEMUX_POLL_INTERVAL", "1.0"))
 
+# Startup-recovery tuning. A 'processing' job whose heartbeat is younger than
+# this many seconds is treated as live even when its flock is not (yet) held;
+# that covers the claim -> lock-acquisition handoff window. Must stay well
+# above the worst gap between worker heartbeats.
+RECOVERY_GRACE_SECONDS = float(
+    os.environ.get("DEMUX_RECOVERY_GRACE_SECONDS", "30"))
+# How long a worker retries the per-job flock before giving up. Recovery only
+# ever holds another job's lock for a quick debris check, so this stays short.
+LOCK_ACQUIRE_SECONDS = float(os.environ.get("DEMUX_LOCK_ACQUIRE_SECONDS", "15"))
+
 for _d in (DATA_DIR, INCOMING_DIR, WORK_DIR, PUBLISHED_DIR):
     _d.mkdir(parents=True, exist_ok=True)

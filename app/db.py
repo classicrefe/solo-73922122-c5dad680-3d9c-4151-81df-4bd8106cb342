@@ -194,6 +194,25 @@ def mark_failed(job_id: str, instance_id: str, error: str) -> None:
         )
 
 
+def fail_interrupted_job(job_id: str, stale_before: str, error: str) -> bool:
+    """Atomically fail a 'processing' job whose heartbeat is stale.
+
+    The WHERE clause makes the update a no-op when the job raced ahead in
+    the meantime: a fresh claim/publish heartbeat or a status change means
+    the row no longer describes a dead owner. Returns True when this call
+    actually transitioned the job to 'failed'.
+    """
+    with tx() as conn:
+        cur = conn.execute(
+            """UPDATE jobs SET status='failed', instance_id=NULL, error=?,
+                              updated_at=?
+               WHERE job_id=? AND status='processing'
+                 AND (heartbeat_at IS NULL OR heartbeat_at < ?)""",
+            (error[:2000], _now(), job_id, stale_before),
+        )
+        return cur.rowcount == 1
+
+
 def requeue_job(job_id: str) -> bool:
     with tx() as conn:
         row = conn.execute(
@@ -233,6 +252,12 @@ def publish_job(job_id: str, lane: str, counts: list[dict[str, Any]]) -> None:
 
 
 # ---------- published lanes / snapshots ----------
+
+def lane_is_published(lane: str) -> bool:
+    """Fresh point check used by recovery right before destructive cleanup."""
+    return get_conn().execute(
+        "SELECT 1 FROM lane_publishes WHERE lane=?", (lane,)).fetchone() is not None
+
 
 def published_lanes() -> list[sqlite3.Row]:
     return get_conn().execute(

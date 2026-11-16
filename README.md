@@ -75,14 +75,42 @@ curl -OJ http://localhost:8001/lanes/demoLane/quarantine/r1
   ever picks up a given job; the other keeps serving requests.
 * Each instance processes one lane at a time in a background thread, so a
   slow lane never blocks uploads, queries or downloads on the event loop.
-* A job runs under an exclusive `flock` on its work directory. Startup
-  recovery removes scratch/staging debris only when no lock is held, and
-  never deletes directories that have a published-lane DB row — so another
-  instance's in-flight work and all published data are preserved.
+  Startup recovery is fully non-blocking (`LOCK_NB` only), so a freshly
+  started instance serves queries immediately instead of waiting for a
+  sibling's lane to finish.
+* A job runs under an exclusive `flock` on its work directory, held for the
+  whole split → stage → publish → cleanup cycle. The worker heartbeats the
+  job row at claim time, every 256 records and at each phase transition.
+* Startup recovery reclaims debris from truly interrupted runs while a
+  sibling instance keeps working, using freshly re-read state only:
+  * a `processing` job whose lock is held **or whose heartbeat is fresh**
+    (younger than `DEMUX_RECOVERY_GRACE_SECONDS`, default 30) is live — the
+    fresh-heartbeat rule covers the claim → lock handoff, so a just-claimed
+    task is never mistaken for a crashed one;
+  * interrupted tasks are failed with an **atomic** `UPDATE … WHERE
+    status='processing' AND heartbeat stale`, so a claim/publish racing
+    recovery turns the update into a no-op;
+  * a lane with a `lane_publishes` row is never deleted, and every delete
+    of a job-associated path re-checks the DB **while holding the job
+    lock** — a publish committing during recovery (rolling restart) cannot
+    lose its files, and late recovery cannot corrupt published state;
+  * truly dead tasks are marked failed, their work/staging/unpublished
+    directories removed, and their original uploads kept so the lane can be
+    retried. Every step is idempotent, so a recovery run that is itself
+    interrupted simply resumes on the next start.
 * Publish order: write/verify outputs in `work/`, move to
   `published/lanes/.tmp.<job>`, atomic `rename` to the final lane directory,
   then insert metadata in one DB transaction. Inputs are deleted only after
   the commit, so a crash at any point leaves no half-visible lane.
+
+### Configuration
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `DEMUX_DATA_DIR` | `/data` | Shared volume root (DB, incoming, work, published) |
+| `DEMUX_POLL_INTERVAL` | `1.0` | Seconds between worker queue polls |
+| `DEMUX_RECOVERY_GRACE_SECONDS` | `30` | Heartbeat age below which a `processing` job is considered live |
+| `DEMUX_LOCK_ACQUIRE_SECONDS` | `15` | How long a worker retries the per-job flock before failing the job |
 
 ## Memory
 
@@ -97,7 +125,9 @@ data with RSS growth below 64 MiB.
 app/            FastAPI app, SQLite layer, streaming splitter, worker
 scripts/        demo FASTQ generator, two-instance integration check
 tests/          pytest suite (happy path, corruption, retry, recovery,
-                barcode rules, size budget, streaming memory)
+                barcode rules, size budget, streaming memory, plus
+                controlled-interleaving regression tests for the
+                claim/publish/startup-recovery handoff)
 Dockerfile      python:3.11-slim, non-root user, /data volume, healthcheck
 docker-compose.yml  two 128 MiB instances sharing one named volume
 ```
@@ -108,3 +138,9 @@ docker-compose.yml  two 128 MiB instances sharing one named volume
 python -m pytest tests/ -q
 python scripts/integration_two_instances.py   # real two-process check
 ```
+
+`tests/test_recovery_interleaving.py` reproduces the rolling-restart races
+deterministically: recovery exposes an `event_hook` at the handoff points,
+so tests can commit a publish or refresh a claim heartbeat exactly while
+recovery is mid-scan, and assert that live tasks and published files are
+never touched.
